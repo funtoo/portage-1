@@ -573,6 +573,116 @@ class portdbapi(dbapi):
 
 		return (metadata, ebuild_hash)
 
+	def parallel_aux_get(self, mycpvlist, mylist, mytree=None, myrepo=None):
+
+		self.running = 0
+
+		results = {}
+
+		def phase2(ebuild_hash, mydata, mylocation, cache_me):
+			mydata["repository"] = self.repositories.get_name_for_location(mylocation)
+			mydata["_mtime_"] = ebuild_hash.mtime
+			eapi = mydata.get("EAPI")
+			if not eapi:
+				eapi = "0"
+				mydata["EAPI"] = eapi
+			if eapi_is_supported(eapi):
+				mydata["INHERITED"] = " ".join(mydata.get("_eclasses_", []))
+
+			#finally, we look at our internal cache entry and return the requested data.
+			returnme = [mydata.get(x, "") for x in mylist]
+
+			if cache_me and self.frozen:
+				aux_cache = {}
+				for x in self._aux_cache_keys:
+					aux_cache[x] = mydata.get(x, "")
+				self._aux_cache[mycpv] = aux_cache
+
+			return returnme
+
+		def aux_exit_listener(proc, ebuild_hash, mylocation, cache_me):
+			self.running -= 1
+
+			if proc.returncode != os.EX_OK:
+				self._broken_ebuilds.add(myebuild)
+				yield mycpv, PortageKeyError(mycpv)
+			mydata = proc.metadata
+			# do we need to have these as arguments to aux_exit_listener?
+			result = phase2(ebuild_hash, mydata, mylocation, cache_me)
+			yield proc.cpv, result
+
+		for mycpv in mycpvlist:
+
+			"stub code for returning auxilliary db information, such as SLOT, DEPEND, etc."
+			'input: "sys-apps/foo-1.0",["SLOT","DEPEND","HOMEPAGE"]'
+			'return: ["0",">=sys-libs/bar-1.0","http://www.foo.com"] or raise PortageKeyError if error'
+			cache_me = False
+			if myrepo is not None:
+				mytree = self.treemap.get(myrepo)
+				if mytree is None:
+					yield mycpv, PortageKeyError(myrepo)
+					continue
+
+			if mytree is not None and len(self.porttrees) == 1 \
+				and mytree == self.porttrees[0]:
+				# mytree matches our only tree, so it's safe to
+				# ignore mytree and cache the result
+				mytree = None
+				myrepo = None
+
+			if mytree is None:
+				cache_me = True
+			if mytree is None and not self._known_keys.intersection(
+				mylist).difference(self._aux_cache_keys):
+				aux_cache = self._aux_cache.get(mycpv)
+				if aux_cache is not None:
+					yield mycpv, [aux_cache.get(x, "") for x in mylist]
+					continue
+				cache_me = True
+
+			try:
+				cat, pkg = mycpv.split("/", 1)
+			except ValueError:
+				# Missing slash. Can't find ebuild so raise PortageKeyError.
+				yield mycpv, PortageKeyError(mycpv)
+				continue
+
+			myebuild, mylocation = self.findname2(mycpv, mytree)
+
+			if not myebuild:
+				writemsg("!!! aux_get(): %s\n" % _("ebuild not found for '%s'") % mycpv, noiselevel=1)
+				yield mycpv, PortageKeyError(mycpv)
+				continue
+
+			mydata, ebuild_hash = self._pull_valid_cache(mycpv, myebuild, mylocation)
+			doregen = mydata is None
+
+			if doregen:
+				if myebuild in self._broken_ebuilds:
+					yield mycpv, PortageKeyError(mycpv)
+
+				proc = EbuildMetadataPhase(cpv=mycpv,
+					ebuild_hash=ebuild_hash, portdb=self,
+					repo_path=mylocation, scheduler=self._event_loop,
+					settings=self.doebuild_settings)
+
+				proc.addExitListener(lambda x: aux_exit_listener(x, ebuild_hash, mylocation, cache_me))
+				self.running += 1
+				proc.start()
+
+				# we will not wait for this to complete -- instead, our ExitListener will be called, above.
+				# Now, let's process the next cpv:
+
+				continue
+
+			result = phase2(ebuild_hash, mydata, mylocation, cache_me)
+			yield mycpv, result
+			continue
+
+		return
+
+
+
 	def aux_get(self, mycpv, mylist, mytree=None, myrepo=None):
 		"stub code for returning auxilliary db information, such as SLOT, DEPEND, etc."
 		'input: "sys-apps/foo-1.0",["SLOT","DEPEND","HOMEPAGE"]'
