@@ -45,6 +45,7 @@ import traceback
 import warnings
 import errno
 import collections
+import time
 
 try:
 	from urllib.parse import urlparse
@@ -278,7 +279,7 @@ class portdbapi(dbapi):
 			depcachedir_unshared = True
 		else:
 			cache_kwargs.update({
-				'gid'     : portage_gid,
+				'gid'	  : portage_gid,
 				'perms'   : 0o664
 			})
 
@@ -445,7 +446,7 @@ class portdbapi(dbapi):
 		""" 
 		Returns the location of the CPV, and what overlay it was in.
 		Searches overlays first, then PORTDIR; this allows us to return the first
-		matching file.  As opposed to starting in portdir and then doing overlays
+		matching file.	As opposed to starting in portdir and then doing overlays
 		second, we would have to exhaustively search the overlays until we found
 		the file we wanted.
 		If myrepo is not None it will find packages from this repository(overlay)
@@ -529,7 +530,7 @@ class portdbapi(dbapi):
 		except FileNotFound:
 			writemsg(_("!!! aux_get(): ebuild for " \
 				"'%s' does not exist at:\n") % (cpv,), noiselevel=-1)
-			writemsg("!!!            %s\n" % ebuild_path, noiselevel=-1)
+			writemsg("!!!		 %s\n" % ebuild_path, noiselevel=-1)
 			raise PortageKeyError(cpv)
 
 		# Pull pre-generated metadata from the metadata/cache/
@@ -575,10 +576,73 @@ class portdbapi(dbapi):
 
 	def parallel_aux_get(self, arglist, mylist=None, mytree=None, myrepo=None):
 
-		self.running = 0
+		"""
+		This is a (currently primitive but quite functional) version of a parallel aux_get. It works! The concept behind this new call
+		is that if the caller already has a list of cpv's that it wants metadata for, why not go ahead and send us the entire
+		list, and we'll take care of doing all the queries in parallel. Results are yielded back to the caller in the form:
 
-		results = {}
+		cpv, [metadata]
 
+		We do not guarantee the order of results returned. If something occurs that would have thrown a PortageKeyError, we
+		do not throw the PortageKeyError, but instead we yield:
+
+		cpv, PortageKeyError(foo)
+
+		Your calling code must process through the results received and determine what to do if a PortageKeyError is encountered.
+
+		Here are different ways to call the method:
+
+		parallel_aux_get([ "sys-apps/foo-1.0", "sys-apps/foo-2.0" ], [ "ECLASS", "INHERITED"] (with optional mytree and myrepo ))
+
+		^^^ When used like this, the specified cpvs are resolved in parallel, and the metadata, mytree and myrepo are constant.
+
+		Alternate method 1:
+
+		parallel_aux_get([ [ "sys-apps/foo-1.0", [ "INHERITED" ]], [ "sys-apps/foo-2.0", [ "ECLASS" ]] ] (with opt. mytree and myrepo ))
+
+		Alternate method 2:
+
+		Alternate method 2 involves stuffing mytree and/or myrepo inside the individual sub-lists at the end, thus allowing full
+		customization of mytree and myrepo for each parallelized aux_get call.
+
+		IMPLEMENTATION:
+
+		This code actually leverages functionality that has been in Portage for a while -- Zac's AsynchronousTask/AbstractPollTask/
+		SubProcess/EbuildMetadataPhase code. I just implemented a more flexible calling convention for aux_get() along with
+		using a generator to return results as they are available. This turns a sometimes very slow, linear process where at most
+		one metadata-generation process is running at a time into something that can cut through uncached metadata like warm
+		butter.
+
+		TODO:
+
+		I want to ask Zac to write a little helper function for this AsynchronousTask.py stuff that will allow me to wait on (poll)
+		multiple running AsynchronousTasks as the same time. Then I can get rid of the hacky time.sleep() calls and get this
+		performing at the highest possible efficiency, clean up the code quite a bit and get it to production-quality so we can
+		merge it into Portage. It's already quite quick but it should then really fly.
+
+		Also, this should auto-detect the number of cores on your system and adjust accordingly. Right now it is hard-coded for
+		8 cores.
+
+		RESULTS:
+
+		When parallel_aux_get is used instead of aux_get with a decently-sized list of cpv's, all your cores will light up and
+		things will go much faster. This is great for corner-case uses of Portage when there is no metadata yet generated. The
+		different ways you can call parallel_aux_get() should provide lots of opportunity to rewrite parts of Portage to use this
+		call instead of the standard aux_get when iterating through lots of packages. (xmatch comes to mind.)
+
+		PROMISE:
+
+		If we can extensively leverage parallel_aux_get within Portage itself, it should eliminate the thorny corner-cases where
+		things get slow because for one reason or another there is no available metadata. It also reduces the need to manually
+		generate metadata, which is an additional step and often quite an ordeal to regen the entire tree. Now you can have
+		Portage quickly generate what it needs. It should be a good first step in getting portage to be multi-core friendly,
+		by effectively addressing the use case where Portage will run very, very slowly and making it an order of magnitude
+		faster on many systems.
+		"""
+
+		self.started = []
+		pending_procs = []
+		print(arglist)
 		def phase2(ebuild_hash, mydata, mylocation, cache_me):
 			mydata["repository"] = self.repositories.get_name_for_location(mylocation)
 			mydata["_mtime_"] = ebuild_hash.mtime
@@ -600,9 +664,12 @@ class portdbapi(dbapi):
 
 			return returnme
 
-		def aux_exit_listener(proc, ebuild_hash, mylocation, cache_me):
-			self.running -= 1
+		def aux_start_listener(proc):
+			self.started.append(proc)
+			print("IN START LISTENER", proc.cpv, len(self.started))
 
+		def aux_exit_listener(proc, ebuild_hash, mylocation, cache_me):
+			print("IN EXIT LISTENER", proc.cpv)
 			if proc.returncode != os.EX_OK:
 				self._broken_ebuilds.add(myebuild)
 				yield mycpv, PortageKeyError(mycpv)
@@ -611,16 +678,46 @@ class portdbapi(dbapi):
 			result = phase2(ebuild_hash, mydata, mylocation, cache_me)
 			yield proc.cpv, result
 
-		for args in arglist:
-			mycpv = args[0]
-			al = len(args)
-			# can specify dynamic mylist, mytree, myrepo for each call, or just set them globally:
-			if al > 1:
-				mylist = args[1]
-			if al > 2:
-				mytree = args[2]
-			if al > 3:
-				myrepo = args[4]
+		while True:
+			print("TRUE")
+			if len(self.started) < 8 and len(pending_procs):
+				proc = pending_procs.pop(0)
+				proc.start()
+			elif len(self.started) >= 8:
+				print("TOO MANY STARTED, LET'S WAIT ON ONE TO FINISH")
+				proc = self.started.pop(0)
+				proc.wait()
+			elif len(pending_procs) > 16:
+				print("WAIT1")
+				time.sleep(0.1)
+				continue
+			print(len(arglist))
+
+			if len(arglist) == 0:
+				if not len(pending_procs) and not len(self.started):
+					return
+				elif len(self.started):
+					proc = self.started.pop(0)
+					proc.wait()
+					continue
+				else:
+					print("WAITABIT")
+					time.sleep(0.05)
+					continue
+
+			args = arglist.pop(0)
+			if type(args) == portage.versions._pkg_str:
+				mycpv = args
+			else:
+				mycpv = args[0]
+				al = len(args)
+				# can specify dynamic mylist, mytree, myrepo for each call, or just set them globally:
+				if al > 1:
+					mylist = args[1]
+				if al > 2:
+					mytree = args[2]
+				if al > 3:
+					myrepo = args[4]
 
 			"stub code for returning auxilliary db information, such as SLOT, DEPEND, etc."
 			'input: "sys-apps/foo-1.0",["SLOT","DEPEND","HOMEPAGE"]'
@@ -641,8 +738,7 @@ class portdbapi(dbapi):
 
 			if mytree is None:
 				cache_me = True
-			if mytree is None and not self._known_keys.intersection(
-				mylist).difference(self._aux_cache_keys):
+			if mytree is None and not self._known_keys.intersection(mylist).difference(self._aux_cache_keys):
 				aux_cache = self._aux_cache.get(mycpv)
 				if aux_cache is not None:
 					yield mycpv, [aux_cache.get(x, "") for x in mylist]
@@ -676,17 +772,17 @@ class portdbapi(dbapi):
 					settings=self.doebuild_settings)
 
 				proc.addExitListener(lambda x: aux_exit_listener(x, ebuild_hash, mylocation, cache_me))
-				self.running += 1
-				proc.start()
+				proc.addStartListener(aux_start_listener)
 
-				# we will not wait for this to complete -- instead, our ExitListener will be called, above.
-				# Now, let's process the next cpv:
+				if len(self.started) < 8:
+					self.started.append(proc)
+					proc.start()
+				else:
+					pending_procs.append(proc)
+			else:
 
-				continue
-
-			result = phase2(ebuild_hash, mydata, mylocation, cache_me)
-			yield mycpv, result
-			continue
+				result = phase2(ebuild_hash, mydata, mylocation, cache_me)
+				yield mycpv, result
 
 		return
 
