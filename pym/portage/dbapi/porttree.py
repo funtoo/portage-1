@@ -573,7 +573,7 @@ class portdbapi(dbapi):
 
 		return (metadata, ebuild_hash)
 
-	def parallel_aux_get(self, mycpvlist, mylist, mytree=None, myrepo=None):
+	def parallel_aux_get(self, arglist, mylist=None, mytree=None, myrepo=None):
 
 		self.running = 0
 
@@ -611,7 +611,16 @@ class portdbapi(dbapi):
 			result = phase2(ebuild_hash, mydata, mylocation, cache_me)
 			yield proc.cpv, result
 
-		for mycpv in mycpvlist:
+		for args in arglist:
+			mycpv = args[0]
+			al = len(args)
+			# can specify dynamic mylist, mytree, myrepo for each call, or just set them globally:
+			if al > 1:
+				mylist = args[1]
+			if al > 2:
+				mytree = args[2]
+			if al > 3:
+				myrepo = args[4]
 
 			"stub code for returning auxilliary db information, such as SLOT, DEPEND, etc."
 			'input: "sys-apps/foo-1.0",["SLOT","DEPEND","HOMEPAGE"]'
