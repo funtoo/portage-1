@@ -1073,12 +1073,18 @@ class config(object):
 	@property
 	def _keywords_manager(self):
 		if self._keywords_manager_obj is None:
+			track_keywords = ""
+			for key in ["conf", "defaults"]:
+				# get TRACK_KEYWORDS setting from config, or profiles:
+				if "TRACK_KEYWORDS" in self.configdict[key]:
+					track_keywords = self.configdict[key]["TRACK_KEYWORDS"]
+					break
 			self._keywords_manager_obj = KeywordsManager(
 				self._locations_manager.profiles_complex,
 				self._locations_manager.abs_user_config,
 				self.local_config,
 				global_accept_keywords=self.configdict["defaults"].get("ACCEPT_KEYWORDS", ""),
-				global_track_keywords=self.configdict["defaults"].get("TRACK_KEYWORDS", ""))
+				global_track_keywords=track_keywords)
 		return self._keywords_manager_obj
 
 	@property
